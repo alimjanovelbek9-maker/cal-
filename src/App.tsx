@@ -2,6 +2,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { ChangeEvent, FormEvent } from 'react'
 import './App.css'
+import { supabase } from './lib/supabase'
 
 /* =====================================================================
    CONFIG  (.env faylida to'ldiring — pastdagi README ga qarang)
@@ -28,7 +29,6 @@ interface Entry { id: string; date: string; meal: MealKey; name: string; kcal: n
 interface PlanMeal { type: MealKey; name: string; kcal: number; p: number; f: number; c: number }
 interface Plan { lang: Lang; analysis: string; tips: string[]; days: PlanMeal[][] }
 interface UserData { profile?: Profile; plan?: Plan; draft?: Form; entries: Entry[]; water: Record<string, number>; tab: Tab; onboarded: boolean }
-interface Account { pass: string; data: UserData }
 interface Targets { bmr: number; tdee: number; kcal: number; protein: number; fat: number; carbs: number; water: number; bmi: number }
 interface Scan { dish: string; grams: number; kcal: number; protein: number; fat: number; carbs: number; fiber: number; sugar: number; vitamins: { n: string; v: string }[]; note: string }
 
@@ -335,12 +335,6 @@ const MEALS: MealKey[] = ['bf', 'ln', 'dn', 'sn']
 const EMOJI: Record<MealKey, string> = { bf: '🍳', ln: '🍲', dn: '🍽️', sn: '🍎' }
 const guessMeal = (): MealKey => { const h = new Date().getHours(); return h < 11 ? 'bf' : h < 16 ? 'ln' : h < 21 ? 'dn' : 'sn' }
 
-async function sha(s: string) {
-  try {
-    const b = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('cal-ai:' + s))
-    return Array.from(new Uint8Array(b)).map((x) => x.toString(16).padStart(2, '0')).join('')
-  } catch { return String(s.split('').reduce((a, c) => (a * 31 + c.charCodeAt(0)) | 0, 7)) }
-}
 const genCode = () => String(100000 + (crypto.getRandomValues(new Uint32Array(1))[0] % 900000))
 
 /* ---- Kunlik norma: Mifflin-St Jeor (deterministik, 100% hisoblangan) ---- */
@@ -453,13 +447,17 @@ export default function App() {
   const t = (k: string, v?: Record<string, string | number>) => tr(lang, k, v)
   const loc = lang === 'zh' ? 'zh-CN' : lang
 
-  /* ---- accounts / session ---- */
-  const [accounts, setAccounts] = useState<Record<string, Account>>(() => load('cal_accounts', {}))
-  const [session, setSession] = useState<string | null>(() => load('cal_session', null))
-  const user = session ? accounts[session]?.data : undefined
+  /* ---- Supabase auth / cloud data ---- */
+  const [session, setSession] = useState<string | null>(null)
+  const [user, setUser] = useState<UserData | undefined>()
+  const [authReady, setAuthReady] = useState(false)
   const patch = (f: (d: UserData) => UserData) => {
     if (!session) return
-    setAccounts((a) => (a[session] ? { ...a, [session]: { ...a[session], data: f(a[session].data) } } : a))
+    setUser((current) => {
+      const next = f(current || { entries: [], water: {}, tab: 'home', onboarded: false })
+      void supabase.from('user_data').upsert({ user_id: session, data: next, updated_at: new Date().toISOString() })
+      return next
+    })
   }
 
   /* ---- auth ui ---- */
@@ -507,14 +505,30 @@ export default function App() {
     document.querySelector('meta[name=theme-color]')?.setAttribute('content', theme === 'dark' ? '#050806' : '#f3f9f4')
     save('cal_prefs', prefs)
   }, [prefs])
-  useEffect(() => save('cal_accounts', accounts), [accounts])
-  useEffect(() => save('cal_session', session), [session])
+  useEffect(() => {
+    let active = true
+    supabase.auth.getSession().then(async ({ data }) => {
+      if (!active) return
+      const authUser = data.session?.user
+      setSession(authUser?.id || null)
+      if (authUser) {
+        const { data: row } = await supabase.from('user_data').select('data').eq('user_id', authUser.id).maybeSingle()
+        if (active) setUser((row?.data as UserData) || { entries: [], water: {}, tab: 'home', onboarded: false })
+      }
+      setAuthReady(true)
+    })
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      setSession(nextSession?.user.id || null)
+      if (!nextSession) setUser(undefined)
+    })
+    return () => { active = false; listener.subscription.unsubscribe() }
+  }, [])
   useEffect(() => { if (cool > 0) { const id = setTimeout(() => setCool((c) => c - 1), 1000); return () => clearTimeout(id) } }, [cool])
   useEffect(() => {
-    const u = session ? accounts[session]?.data : undefined
+    const u = user
     setForm(u?.profile ? toForm(u.profile) : u?.draft ? { ...F0, ...u.draft } : F0)
     setEditing(false)
-  }, [session])
+  }, [session, user])
   useEffect(() => { if (session && user && !user.onboarded) patch((d) => ({ ...d, draft: form })) }, [form])
   useEffect(() => {
     setReady(false)
@@ -546,7 +560,7 @@ export default function App() {
   /* =================== AUTH LOGIC =================== */
   const normEmail = email.trim().toLowerCase()
   const resetAuth = () => { setStep('form'); setPassword(''); setCodeIn(''); setPending(null); setDemo(''); setErr(''); setCool(0) }
-  const enter = (em: string) => { setSession(em); setEmail(''); resetAuth() }
+  const enter = () => { setEmail(''); resetAuth() }
 
   async function sendCode(em: string) {
     setBusy(true); setErr('')
@@ -566,25 +580,42 @@ export default function App() {
     const needPass = mode === 'reg' || method === 'pass'
     if (!emailOk(normEmail) || (needPass && !password)) return setErr(t('fill'))
     if (mode === 'reg' && password.length < 6) return setErr(t('short'))
-    const acc = accounts[normEmail]
-    if (mode === 'reg' && acc) return setErr(t('exists'))
-    if (mode === 'login' && !acc) return setErr(t('noAcc'))
-    if (mode === 'login' && method === 'pass') {
-      setBusy(true); const h = await sha(password); setBusy(false)
-      return h === acc.pass ? enter(normEmail) : setErr(t('badPass'))
+    setBusy(true)
+    const result = mode === 'reg'
+      ? await supabase.auth.signUp({ email: normEmail, password })
+      : method === 'pass'
+        ? await supabase.auth.signInWithPassword({ email: normEmail, password })
+        : await supabase.auth.signInWithOtp({ email: normEmail, options: { shouldCreateUser: false } })
+    setBusy(false)
+    if (result.error) {
+      const message = result.error.message.toLowerCase()
+      if (message.includes('already registered') || message.includes('already exists')) return setErr(t('exists'))
+      if (message.includes('invalid login') || message.includes('not found')) return setErr(mode === 'login' ? t('badPass') : t('err'))
+      if (message.includes('confirm')) return setErr(result.error.message)
+      return setErr(t('err'))
     }
-    await sendCode(normEmail)
+    if (mode === 'reg') {
+      if (!result.data.session) { setDemo('Emailingizni tasdiqlash uchun xatni tekshiring'); return }
+      await supabase.from('user_data').upsert({ user_id: result.data.user.id, data: { entries: [], water: {}, tab: 'home', onboarded: false }, updated_at: new Date().toISOString() })
+    }
+    if (method === 'code') { setStep('code'); setCodeIn(''); setCool(30) } else enter()
   }
   async function confirmCode(e: FormEvent) {
     e.preventDefault()
-    if (!pending) return
-    if (Date.now() > pending.exp || pending.tries >= 5) return setErr(t('expired'))
-    if (codeIn.trim() !== pending.code) { setPending({ ...pending, tries: pending.tries + 1 }); return setErr(t('badCode')) }
-    if (mode === 'reg') {
-      const h = await sha(password)
-      setAccounts((a) => ({ ...a, [normEmail]: { pass: h, data: { entries: [], water: {}, tab: 'home', onboarded: false } } }))
+    if (method !== 'code') return
+    if (mode === 'reg' && pending) {
+      if (Date.now() > pending.exp || pending.tries >= 5) return setErr(t('expired'))
+      if (codeIn.trim() !== pending.code) { setPending({ ...pending, tries: pending.tries + 1 }); return setErr(t('badCode')) }
     }
-    enter(normEmail)
+    if (method === 'code') {
+      setBusy(true)
+      const { data, error } = await supabase.auth.verifyOtp({ email: normEmail, token: codeIn.trim(), type: 'email' })
+      setBusy(false)
+      if (error || !data.user) return setErr(error?.message || t('badCode'))
+      const { data: row } = await supabase.from('user_data').select('data').eq('user_id', data.user.id).maybeSingle()
+      setUser((row?.data as UserData) || { entries: [], water: {}, tab: 'home', onboarded: false })
+    }
+    enter()
   }
 
   /* =================== ONBOARDING LOGIC =================== */
@@ -968,7 +999,7 @@ export default function App() {
         <div className="card-h"><h3>{t('lang')}</h3></div>
         <div className="lang-grid">{LANGS.map((l) => <button key={l.c} className={'lang-item' + (l.c === lang ? ' on' : '')} onClick={() => setLang(l.c)}><span>{l.f}</span>{l.n}</button>)}</div>
       </section>
-      <button className="btn ghost span2" onClick={() => { setSession(null); resetAuth() }}><Ic n="logout" s={20} />{t('logout')}</button>
+      <button className="btn ghost span2" onClick={() => { void supabase.auth.signOut(); setSession(null); setUser(undefined); resetAuth() }}><Ic n="logout" s={20} />{t('logout')}</button>
     </main>
   )
 
@@ -1068,7 +1099,9 @@ export default function App() {
 
   /* =================== MAIN RENDER =================== */
   let body
-  if (!user) body = renderAuth()
+  if (!authReady) body = <div className="auth"><main className="auth-card pop"><h1>Caloriest AI</h1><p className="muted">Hisob tekshirilmoqda...</p><i className="spin" /></main></div>
+  else if (!session) body = renderAuth()
+  else if (!user) body = <div className="auth"><div className="card rise"><i className="spin" /></div></div>
   else if (!user.onboarded || editing || !user.profile) body = renderOnboard()
   else {
     const tg = targets(user.profile)
